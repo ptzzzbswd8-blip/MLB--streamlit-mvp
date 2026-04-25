@@ -1,2 +1,624 @@
 # MLB--streamlit-mvp
 Mrbets850 propfinder
+import datetime as dt
+import sqlite3
+from pathlib import Path
+from typing import Dict, List
+
+import pandas as pd
+import requests
+import streamlit as st
+
+st.set_page_config(page_title="MLB Analyst MVP", layout="wide")
+
+BASE = "https://statsapi.mlb.com/api/v1"
+PEOPLE = f"{BASE}/people"
+APP_DIR = Path(__file__).resolve().parent
+DATA_DIR = APP_DIR / "data"
+DB_PATH = DATA_DIR / "mlb_analyst.db"
+SNAPSHOT_TABLES = {
+    "slate": "slate_snapshots",
+    "batters": "batter_snapshots",
+    "pitchers": "pitcher_snapshots",
+}
+
+
+def ensure_data_dir() -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+
+@st.cache_data(ttl=1800)
+def fetch_json(url: str, params: Dict | None = None) -> Dict:
+    resp = requests.get(url, params=params, timeout=30)
+    resp.raise_for_status()
+    return resp.json()
+
+
+@st.cache_data(ttl=1800)
+def get_schedule(date_str: str) -> pd.DataFrame:
+    params = {
+        "sportId": 1,
+        "date": date_str,
+        "hydrate": "probablePitcher,linescore,team,venue",
+    }
+    data = fetch_json(f"{BASE}/schedule", params)
+    rows: List[Dict] = []
+    for date_block in data.get("dates", []):
+        for g in date_block.get("games", []):
+            away = g.get("teams", {}).get("away", {})
+            home = g.get("teams", {}).get("home", {})
+            rows.append(
+                {
+                    "gamePk": g.get("gamePk"),
+                    "date": date_str,
+                    "game_time": g.get("gameDate"),
+                    "away_team": away.get("team", {}).get("name"),
+                    "home_team": home.get("team", {}).get("name"),
+                    "away_probable": away.get("probablePitcher", {}).get("fullName", "TBD"),
+                    "home_probable": home.get("probablePitcher", {}).get("fullName", "TBD"),
+                    "venue": g.get("venue", {}).get("name"),
+                    "status": g.get("status", {}).get("detailedState"),
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+@st.cache_data(ttl=21600)
+def get_teams() -> pd.DataFrame:
+    data = fetch_json(f"{BASE}/teams", {"sportId": 1, "activeStatus": "Y"})
+    rows = []
+    for t in data.get("teams", []):
+        rows.append({"team_id": t["id"], "team_name": t["name"], "abbreviation": t.get("abbreviation")})
+    return pd.DataFrame(rows).sort_values("team_name")
+
+
+@st.cache_data(ttl=21600)
+def get_roster(team_id: int, season: int) -> pd.DataFrame:
+    data = fetch_json(f"{BASE}/teams/{team_id}/roster", {"rosterType": "active", "season": season})
+    rows = []
+    for p in data.get("roster", []):
+        person = p.get("person", {})
+        pos = p.get("position", {})
+        rows.append(
+            {
+                "player_id": person.get("id"),
+                "player_name": person.get("fullName"),
+                "position": pos.get("abbreviation"),
+                "status": p.get("status", {}).get("description"),
+                "team_id": team_id,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+@st.cache_data(ttl=21600)
+def get_people_chunk(player_ids: List[int]) -> pd.DataFrame:
+    if not player_ids:
+        return pd.DataFrame()
+    params = {"personIds": ",".join(map(str, player_ids)), "hydrate": "currentTeam"}
+    data = fetch_json(PEOPLE, params)
+    rows = []
+    for p in data.get("people", []):
+        rows.append(
+            {
+                "player_id": p.get("id"),
+                "bats": p.get("batSide", {}).get("code"),
+                "throws": p.get("pitchHand", {}).get("code"),
+                "height": p.get("height"),
+                "weight": p.get("weight"),
+                "birthDate": p.get("birthDate"),
+                "current_team": p.get("currentTeam", {}).get("name"),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+@st.cache_data(ttl=21600)
+def get_team_people(team_ids: List[int], season: int) -> pd.DataFrame:
+    rosters = [get_roster(int(tid), season) for tid in team_ids]
+    roster_df = pd.concat([df for df in rosters if not df.empty], ignore_index=True) if rosters else pd.DataFrame()
+    if roster_df.empty:
+        return roster_df
+    ids = roster_df["player_id"].dropna().astype(int).tolist()
+    chunks = [ids[i:i + 50] for i in range(0, len(ids), 50)]
+    people = [get_people_chunk(chunk) for chunk in chunks]
+    people_df = pd.concat([df for df in people if not df.empty], ignore_index=True)
+    return roster_df.merge(people_df, on="player_id", how="left")
+
+
+@st.cache_data(ttl=21600)
+def get_player_stats(player_ids: List[int], season: int, group: str, stat_type: str = "season") -> pd.DataFrame:
+    if not player_ids:
+        return pd.DataFrame()
+    chunks = [player_ids[i:i + 20] for i in range(0, len(player_ids), 20)]
+    rows = []
+    for chunk in chunks:
+        params = {
+            "personIds": ",".join(map(str, chunk)),
+            "hydrate": f"stats(group=[{group}],type=[{stat_type}],season={season})",
+        }
+        data = fetch_json(PEOPLE, params)
+        for p in data.get("people", []):
+            splits = p.get("stats", [{}])[0].get("splits", []) if p.get("stats") else []
+            if stat_type == "season":
+                stat = splits[0].get("stat", {}) if splits else {}
+                row = {"player_id": p.get("id"), "player_name": p.get("fullName")}
+                row.update(stat)
+                rows.append(row)
+            else:
+                for split in splits:
+                    stat = split.get("stat", {})
+                    row = {
+                        "player_id": p.get("id"),
+                        "player_name": p.get("fullName"),
+                        "date": split.get("date"),
+                        "gamePk": split.get("game", {}).get("gamePk"),
+                    }
+                    row.update(stat)
+                    rows.append(row)
+    return pd.DataFrame(rows)
+
+
+@st.cache_data(ttl=21600)
+def get_player_gamelogs(player_ids: List[int], season: int, group: str) -> pd.DataFrame:
+    return get_player_stats(player_ids, season, group, stat_type="gameLog")
+
+
+
+def convert_numeric(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
+    out = df.copy()
+    for col in cols:
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce")
+    return out
+
+
+
+def baseball_ip_to_outs(value) -> int:
+    if pd.isna(value):
+        return 0
+    text = str(value)
+    if not text or text == "nan":
+        return 0
+    if "." in text:
+        whole, frac = text.split(".", 1)
+        try:
+            return int(whole) * 3 + int(frac[:1] or 0)
+        except ValueError:
+            return 0
+    try:
+        return int(float(text)) * 3
+    except ValueError:
+        return 0
+
+
+
+def outs_to_baseball_ip(outs: int) -> str:
+    outs = int(outs or 0)
+    return f"{outs // 3}.{outs % 3}"
+
+
+
+def safe_div(num: float, den: float) -> float | None:
+    if den and den != 0:
+        return num / den
+    return None
+
+
+
+def total_bases_from_logs(df: pd.DataFrame) -> pd.Series:
+    if "totalBases" in df.columns:
+        return pd.to_numeric(df["totalBases"], errors="coerce").fillna(0)
+    hits = pd.to_numeric(df.get("hits", 0), errors="coerce").fillna(0)
+    doubles = pd.to_numeric(df.get("doubles", 0), errors="coerce").fillna(0)
+    triples = pd.to_numeric(df.get("triples", 0), errors="coerce").fillna(0)
+    home_runs = pd.to_numeric(df.get("homeRuns", 0), errors="coerce").fillna(0)
+    return hits + doubles + (2 * triples) + (3 * home_runs)
+
+
+
+def compute_hitting_rollups(logs: pd.DataFrame, end_date: dt.date) -> pd.DataFrame:
+    if logs.empty:
+        return pd.DataFrame(columns=["player_id"])
+    df = logs.copy()
+    df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.date
+    df = df[df["date"].notna() & (df["date"] <= end_date)]
+    if df.empty:
+        return pd.DataFrame(columns=["player_id"])
+
+    numeric_cols = [
+        "gamesPlayed", "plateAppearances", "atBats", "runs", "hits", "doubles", "triples", "homeRuns",
+        "rbi", "baseOnBalls", "strikeOuts", "stolenBases", "hitByPitch", "sacFlies"
+    ]
+    df = convert_numeric(df, numeric_cols)
+    df["totalBases_calc"] = total_bases_from_logs(df)
+
+    result = pd.DataFrame({"player_id": sorted(df["player_id"].dropna().unique())})
+    for window in (7, 15, 30):
+        start_date = end_date - dt.timedelta(days=window - 1)
+        slice_df = df[df["date"] >= start_date]
+        if slice_df.empty:
+            continue
+        agg = (
+            slice_df.groupby("player_id", as_index=False)
+            .agg(
+                L_G=("gamePk", "nunique"),
+                L_PA=("plateAppearances", "sum"),
+                L_AB=("atBats", "sum"),
+                L_H=("hits", "sum"),
+                L_2B=("doubles", "sum"),
+                L_3B=("triples", "sum"),
+                L_HR=("homeRuns", "sum"),
+                L_RBI=("rbi", "sum"),
+                L_BB=("baseOnBalls", "sum"),
+                L_SO=("strikeOuts", "sum"),
+                L_SB=("stolenBases", "sum"),
+                L_HBP=("hitByPitch", "sum"),
+                L_SF=("sacFlies", "sum"),
+                L_TB=("totalBases_calc", "sum"),
+            )
+        )
+        agg[f"L{window}_AVG"] = agg.apply(lambda r: round(safe_div(r["L_H"], r["L_AB"]), 3) if safe_div(r["L_H"], r["L_AB"]) is not None else None, axis=1)
+        agg[f"L{window}_OBP"] = agg.apply(
+            lambda r: round(safe_div(r["L_H"] + r["L_BB"] + r["L_HBP"], r["L_AB"] + r["L_BB"] + r["L_HBP"] + r["L_SF"]), 3)
+            if safe_div(r["L_H"] + r["L_BB"] + r["L_HBP"], r["L_AB"] + r["L_BB"] + r["L_HBP"] + r["L_SF"]) is not None
+            else None,
+            axis=1,
+        )
+        agg[f"L{window}_SLG"] = agg.apply(lambda r: round(safe_div(r["L_TB"], r["L_AB"]), 3) if safe_div(r["L_TB"], r["L_AB"]) is not None else None, axis=1)
+        obp = agg[f"L{window}_OBP"].fillna(0)
+        slg = agg[f"L{window}_SLG"].fillna(0)
+        agg[f"L{window}_OPS"] = (obp + slg).round(3)
+        rename_map = {col: f"L{window}_{col[2:]}" for col in ["L_G", "L_PA", "L_AB", "L_H", "L_2B", "L_3B", "L_HR", "L_RBI", "L_BB", "L_SO", "L_SB", "L_TB"]}
+        agg = agg.rename(columns=rename_map).drop(columns=["L_HBP", "L_SF"], errors="ignore")
+        result = result.merge(agg, on="player_id", how="left")
+    return result
+
+
+
+def compute_pitching_rollups(logs: pd.DataFrame, end_date: dt.date) -> pd.DataFrame:
+    if logs.empty:
+        return pd.DataFrame(columns=["player_id"])
+    df = logs.copy()
+    df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.date
+    df = df[df["date"].notna() & (df["date"] <= end_date)]
+    if df.empty:
+        return pd.DataFrame(columns=["player_id"])
+
+    numeric_cols = ["gamesStarted", "gamesPlayed", "hits", "runs", "earnedRuns", "homeRuns", "baseOnBalls", "strikeOuts", "battersFaced"]
+    df = convert_numeric(df, numeric_cols)
+    df["outs_recorded"] = df.get("inningsPitched", pd.Series(dtype="object")).apply(baseball_ip_to_outs)
+
+    result = pd.DataFrame({"player_id": sorted(df["player_id"].dropna().unique())})
+    for window in (7, 15, 30):
+        start_date = end_date - dt.timedelta(days=window - 1)
+        slice_df = df[df["date"] >= start_date]
+        if slice_df.empty:
+            continue
+        agg = (
+            slice_df.groupby("player_id", as_index=False)
+            .agg(
+                G=("gamePk", "nunique"),
+                GS=("gamesStarted", "sum"),
+                OUTS=("outs_recorded", "sum"),
+                H=("hits", "sum"),
+                R=("runs", "sum"),
+                ER=("earnedRuns", "sum"),
+                HR=("homeRuns", "sum"),
+                BB=("baseOnBalls", "sum"),
+                SO=("strikeOuts", "sum"),
+                BF=("battersFaced", "sum"),
+            )
+        )
+        agg[f"L{window}_IP"] = agg["OUTS"].apply(outs_to_baseball_ip)
+        agg[f"L{window}_ERA"] = agg.apply(lambda r: round((r["ER"] * 27) / r["OUTS"], 2) if r["OUTS"] else None, axis=1)
+        agg[f"L{window}_WHIP"] = agg.apply(lambda r: round((r["H"] + r["BB"]) / (r["OUTS"] / 3), 2) if r["OUTS"] else None, axis=1)
+        agg[f"L{window}_K9"] = agg.apply(lambda r: round((r["SO"] * 27) / r["OUTS"], 2) if r["OUTS"] else None, axis=1)
+        agg = agg.rename(columns={
+            "G": f"L{window}_G", "GS": f"L{window}_GS", "H": f"L{window}_H", "R": f"L{window}_R",
+            "ER": f"L{window}_ER", "HR": f"L{window}_HR", "BB": f"L{window}_BB", "SO": f"L{window}_SO", "BF": f"L{window}_BF"
+        }).drop(columns=["OUTS"], errors="ignore")
+        result = result.merge(agg, on="player_id", how="left")
+    return result
+
+
+
+def build_batter_board(team_people: pd.DataFrame, season: int, end_date: dt.date, include_rolling: bool) -> pd.DataFrame:
+    hitters = team_people[team_people["position"] != "P"].copy()
+    if hitters.empty:
+        return hitters
+    stats = get_player_stats(hitters["player_id"].astype(int).tolist(), season, "hitting")
+    df = hitters.merge(stats, on=["player_id", "player_name"], how="left")
+    df = convert_numeric(df, ["avg", "obp", "slg", "ops"])
+    if include_rolling:
+        logs = get_player_gamelogs(hitters["player_id"].astype(int).tolist(), season, "hitting")
+        rolling = compute_hitting_rollups(logs, end_date)
+        df = df.merge(rolling, on="player_id", how="left")
+    if "ops" in df.columns:
+        df = df.sort_values("ops", ascending=False, na_position="last")
+    keep = [
+        "player_name", "current_team", "position", "bats", "throws", "gamesPlayed", "plateAppearances",
+        "atBats", "runs", "hits", "doubles", "triples", "homeRuns", "rbi", "baseOnBalls", "strikeOuts",
+        "stolenBases", "avg", "obp", "slg", "ops",
+        "L7_G", "L7_PA", "L7_H", "L7_HR", "L7_TB", "L7_AVG", "L7_OBP", "L7_SLG", "L7_OPS",
+        "L15_G", "L15_PA", "L15_H", "L15_HR", "L15_TB", "L15_AVG", "L15_OBP", "L15_SLG", "L15_OPS",
+        "L30_G", "L30_PA", "L30_H", "L30_HR", "L30_TB", "L30_AVG", "L30_OBP", "L30_SLG", "L30_OPS",
+    ]
+    keep = [c for c in keep if c in df.columns]
+    return df[keep]
+
+
+
+def build_pitcher_board(team_people: pd.DataFrame, season: int, end_date: dt.date, include_rolling: bool) -> pd.DataFrame:
+    pitchers = team_people[team_people["position"] == "P"].copy()
+    if pitchers.empty:
+        return pitchers
+    stats = get_player_stats(pitchers["player_id"].astype(int).tolist(), season, "pitching")
+    df = pitchers.merge(stats, on=["player_id", "player_name"], how="left")
+    numeric_cols = ["era", "whip", "strikePercentage", "strikeOuts", "baseOnBalls", "hits", "runs"]
+    df = convert_numeric(df, numeric_cols)
+    if include_rolling:
+        logs = get_player_gamelogs(pitchers["player_id"].astype(int).tolist(), season, "pitching")
+        rolling = compute_pitching_rollups(logs, end_date)
+        df = df.merge(rolling, on="player_id", how="left")
+    if "strikeOuts" in df.columns:
+        df = df.sort_values("strikeOuts", ascending=False, na_position="last")
+    keep = [
+        "player_name", "current_team", "throws", "gamesPlayed", "gamesStarted", "wins", "losses",
+        "inningsPitched", "era", "whip", "strikeOuts", "baseOnBalls", "hits", "runs", "homeRuns", "battersFaced",
+        "L7_G", "L7_GS", "L7_IP", "L7_SO", "L7_BB", "L7_H", "L7_ER", "L7_HR", "L7_ERA", "L7_WHIP", "L7_K9",
+        "L15_G", "L15_GS", "L15_IP", "L15_SO", "L15_BB", "L15_H", "L15_ER", "L15_HR", "L15_ERA", "L15_WHIP", "L15_K9",
+        "L30_G", "L30_GS", "L30_IP", "L30_SO", "L30_BB", "L30_H", "L30_ER", "L30_HR", "L30_ERA", "L30_WHIP", "L30_K9",
+    ]
+    keep = [c for c in keep if c in df.columns]
+    return df[keep]
+
+
+
+def style_datetime_col(df: pd.DataFrame) -> pd.DataFrame:
+    if "game_time" in df.columns:
+        out = df.copy()
+        out["game_time"] = pd.to_datetime(out["game_time"], utc=True, errors="coerce").dt.tz_convert("US/Central").dt.strftime("%Y-%m-%d %I:%M %p %Z")
+        return out
+    return df
+
+
+
+def infer_scope_team_ids(schedule_df: pd.DataFrame, teams_df: pd.DataFrame, selected_teams: List[str]) -> List[int]:
+    if selected_teams:
+        return teams_df[teams_df["team_name"].isin(selected_teams)]["team_id"].tolist()
+    if schedule_df.empty:
+        return teams_df["team_id"].tolist()
+    slate_names = pd.unique(schedule_df[["away_team", "home_team"]].values.ravel("K")).tolist()
+    return teams_df[teams_df["team_name"].isin(slate_names)]["team_id"].tolist()
+
+
+
+def init_db() -> None:
+    ensure_data_dir()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("CREATE TABLE IF NOT EXISTS snapshot_log (table_name TEXT, snapshot_date TEXT, saved_at TEXT, row_count INTEGER)")
+        conn.commit()
+
+
+
+def save_snapshot(table_key: str, snapshot_date: str, df: pd.DataFrame) -> None:
+    if df.empty:
+        return
+    init_db()
+    table_name = SNAPSHOT_TABLES[table_key]
+    payload = df.copy()
+    payload.insert(0, "snapshot_date", snapshot_date)
+    payload.insert(1, "saved_at", dt.datetime.now().isoformat(timespec="seconds"))
+    with sqlite3.connect(DB_PATH) as conn:
+        payload.to_sql(table_name, conn, if_exists="append", index=False)
+        conn.execute(
+            "INSERT INTO snapshot_log (table_name, snapshot_date, saved_at, row_count) VALUES (?, ?, ?, ?)",
+            (table_name, snapshot_date, dt.datetime.now().isoformat(timespec="seconds"), int(len(payload))),
+        )
+        conn.commit()
+
+
+
+def get_snapshot_log() -> pd.DataFrame:
+    if not DB_PATH.exists():
+        return pd.DataFrame(columns=["table_name", "snapshot_date", "saved_at", "row_count"])
+    with sqlite3.connect(DB_PATH) as conn:
+        return pd.read_sql_query("SELECT * FROM snapshot_log ORDER BY saved_at DESC", conn)
+
+
+
+def get_snapshot_preview(table_key: str, limit: int = 100) -> pd.DataFrame:
+    if not DB_PATH.exists():
+        return pd.DataFrame()
+    table_name = SNAPSHOT_TABLES[table_key]
+    with sqlite3.connect(DB_PATH) as conn:
+        exists = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table_name,)).fetchone()
+        if not exists:
+            return pd.DataFrame()
+        return pd.read_sql_query(f"SELECT * FROM {table_name} ORDER BY saved_at DESC LIMIT {int(limit)}", conn)
+
+
+
+def maybe_filter_name(df: pd.DataFrame, name_search: str) -> pd.DataFrame:
+    if df.empty or not name_search or "player_name" not in df.columns:
+        return df
+    return df[df["player_name"].str.lower().str.contains(name_search, na=False)]
+
+
+
+def download_db_button() -> None:
+    if DB_PATH.exists():
+        with open(DB_PATH, "rb") as f:
+            st.download_button("Download SQLite DB", f.read(), file_name="mlb_analyst.db", mime="application/octet-stream")
+
+
+
+def main() -> None:
+    st.title("MLB Analyst MVP")
+    st.caption("Daily slate, batter board, pitcher board, rolling form, and local SQLite snapshots for a fast handicapping workflow.")
+
+    today = dt.date.today()
+    season_default = today.year
+
+    st.sidebar.header("Filters")
+    selected_date = st.sidebar.date_input("Slate date", value=today)
+    season = int(st.sidebar.number_input("Season", min_value=2015, max_value=season_default, value=season_default, step=1))
+    include_rolling = st.sidebar.checkbox("Load rolling last 7 / 15 / 30", value=True)
+
+    teams_df = get_teams()
+    selected_teams = st.sidebar.multiselect("Teams", options=teams_df["team_name"].tolist(), default=[])
+    name_search = st.sidebar.text_input("Player search", value="").strip().lower()
+
+    date_str = selected_date.strftime("%Y-%m-%d")
+    schedule_df = get_schedule(date_str)
+    scope_team_ids = infer_scope_team_ids(schedule_df, teams_df, selected_teams)
+    team_people = get_team_people(scope_team_ids, season)
+
+    batter_df = build_batter_board(team_people, season, selected_date, include_rolling)
+    pitcher_df = build_pitcher_board(team_people, season, selected_date, include_rolling)
+
+    if selected_teams:
+        schedule_df = schedule_df[(schedule_df["away_team"].isin(selected_teams)) | (schedule_df["home_team"].isin(selected_teams))]
+        if not batter_df.empty:
+            batter_df = batter_df[batter_df["current_team"].isin(selected_teams)]
+        if not pitcher_df.empty:
+            pitcher_df = pitcher_df[pitcher_df["current_team"].isin(selected_teams)]
+
+    batter_df = maybe_filter_name(batter_df, name_search)
+    pitcher_df = maybe_filter_name(pitcher_df, name_search)
+
+    st.sidebar.header("Snapshots")
+    c1, c2 = st.sidebar.columns(2)
+    if c1.button("Save boards"):
+        save_snapshot("slate", date_str, schedule_df)
+        save_snapshot("batters", date_str, batter_df)
+        save_snapshot("pitchers", date_str, pitcher_df)
+        st.sidebar.success("Saved current slate, batter, and pitcher boards to SQLite.")
+    if c2.button("Clear cache"):
+        st.cache_data.clear()
+        st.sidebar.success("Streamlit cache cleared.")
+    download_db_button()
+
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(["Daily Slate", "Batters", "Pitchers", "Snapshot History", "Notes"])
+
+    with tab1:
+        st.subheader(f"Games for {date_str}")
+        if schedule_df.empty:
+            st.info("No MLB games found for this date.")
+        else:
+            st.dataframe(style_datetime_col(schedule_df), use_container_width=True, hide_index=True)
+            st.download_button(
+                "Download slate CSV",
+                schedule_df.to_csv(index=False).encode("utf-8"),
+                file_name=f"mlb_slate_{date_str}.csv",
+                mime="text/csv",
+            )
+
+    with tab2:
+        st.subheader("Batter board")
+        st.caption("Season board plus last 7, 15, and 30 day form windows for hits, HR, total bases, and rate stats.")
+        if batter_df.empty:
+            st.info("No batter data available for the selected filters.")
+        else:
+            st.dataframe(batter_df, use_container_width=True, hide_index=True)
+            st.download_button(
+                "Download batter CSV",
+                batter_df.to_csv(index=False).encode("utf-8"),
+                file_name=f"batters_{date_str}.csv",
+                mime="text/csv",
+            )
+
+    with tab3:
+        st.subheader("Pitcher board")
+        st.caption("Season board plus last 7, 15, and 30 day form windows for IP, Ks, ERA, WHIP, HR allowed, and K/9.")
+        if pitcher_df.empty:
+            st.info("No pitcher data available for the selected filters.")
+        else:
+            st.dataframe(pitcher_df, use_container_width=True, hide_index=True)
+            st.download_button(
+                "Download pitcher CSV",
+                pitcher_df.to_csv(index=False).encode("utf-8"),
+                file_name=f"pitchers_{date_str}.csv",
+                mime="text/csv",
+            )
+
+    with tab4:
+        st.subheader("Snapshot history")
+        log_df = get_snapshot_log()
+        if log_df.empty:
+            st.info("No snapshots saved yet. Use the Save boards button in the sidebar.")
+        else:
+            st.dataframe(log_df, use_container_width=True, hide_index=True)
+            preview_key = st.selectbox("Preview saved table", options=["slate", "batters", "pitchers"])
+            preview_df = get_snapshot_preview(preview_key)
+            if not preview_df.empty:
+                st.dataframe(preview_df, use_container_width=True, hide_index=True)
+
+    with tab5:
+        st.subheader("Next upgrades")
+        st.markdown(
+            """
+- Add handedness splits and home/away splits.
+- Add opponent matchup joins from the daily slate so probable pitcher context sits next to each hitter.
+- Add Statcast quality-of-contact fields through pybaseball.
+- Add your own model tags like HR lean, TB lean, hit lean, K lean, or fade.
+- Add a morning auto-run script to save fresh boards into SQLite before you handicap the slate.
+            """
+        )
+
+    st.divider()
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Games on slate", int(len(schedule_df)))
+    m2.metric("Batters loaded", int(len(batter_df)))
+    m3.metric("Pitchers loaded", int(len(pitcher_df)))
+    m4.metric("Snapshots saved", int(len(get_snapshot_log())))
+
+
+if __name__ == "__main__":
+    main()
+# MLB Analyst MVP (Streamlit)
+
+A fast Streamlit starter app for daily MLB analysis and handicapping.
+
+## What it does
+- Pulls the MLB daily slate from the public MLB Stats API
+- Shows probable pitchers when available
+- Builds a batter board from active rosters plus season hitting stats
+- Builds a pitcher board from active rosters plus season pitching stats
+- Adds rolling last 7 / 15 / 30 day form windows from player game logs
+- Saves current slate, batter, and pitcher boards into a local SQLite database
+- Lets you filter by date, team, and player name
+- Exports slate, batter, and pitcher tables to CSV
+
+## Files
+- `app.py` - main Streamlit app
+- `requirements.txt` - Python packages
+- `data/mlb_analyst.db` - created automatically after you save snapshots
+
+## Run locally
+```bash
+pip install -r requirements.txt
+streamlit run app.py
+```
+
+## How to use it
+1. Launch the app.
+2. Pick your slate date and optional team filter.
+3. Leave rolling windows on if you want last 7 / 15 / 30 form.
+4. Review the Daily Slate, Batters, and Pitchers tabs.
+5. Click `Save boards` in the sidebar to archive the current view into SQLite.
+6. Use `Snapshot History` to review what you saved.
+
+## Good next upgrades
+1. Add handedness splits
+2. Add hitter vs probable pitcher joins
+3. Add Statcast via pybaseball
+4. Add your own prop model flags
+5. Automate a morning snapshot job
+
+## Notes
+This version is meant to get you a practical analyst workflow fast, then give you a clean path into a real handicapping database.
+streamlit>=1.44
+pandas>=2.2
+requests>=2.32
